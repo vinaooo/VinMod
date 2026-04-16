@@ -1,0 +1,8 @@
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# Appended specific rules from prompt
+*_backup
+/tests
+/docs
