@@ -36,6 +36,18 @@ impl BuildStage {
             Self::Finalize => "Finalizing build output...\n",
         }
     }
+
+    fn key(self) -> &'static str {
+        match self {
+            Self::PrepareWorkspace => "prepare-workspace",
+            Self::ValidateToolchain => "validate-toolchain",
+            Self::EnsureSource => "ensure-source",
+            Self::ConfigureKernel => "configure-kernel",
+            Self::CompileKernel => "compile-kernel",
+            Self::PackageOutput => "package-output",
+            Self::Finalize => "finalize",
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -163,11 +175,8 @@ impl<P: ProcessExecutor, F: FileSystem> BuildService<P, F> {
         );
 
         let paths = BuildPaths::new(self.work_dir.clone(), config);
-        self.filesystem.create_dir_all(&paths.root)?;
 
-        self.write_manifest(config, &paths)?;
-
-        for stage in [
+        let stages = [
             BuildStage::PrepareWorkspace,
             BuildStage::ValidateToolchain,
             BuildStage::EnsureSource,
@@ -175,16 +184,26 @@ impl<P: ProcessExecutor, F: FileSystem> BuildService<P, F> {
             BuildStage::CompileKernel,
             BuildStage::PackageOutput,
             BuildStage::Finalize,
-        ] {
+        ];
+        let total_stages = stages.len();
+
+        for (index, stage) in stages.into_iter().enumerate() {
             if is_cancelled() {
                 emit("\n--- Build Stopped by User ---\n".to_string());
                 return Ok(());
             }
 
+            emit(format!(
+                "__PROGRESS__|{}|{}|{}\n",
+                index + 1,
+                total_stages,
+                stage.key()
+            ));
+
             emit(stage.label().to_string());
 
             let stage_result = match stage {
-                BuildStage::PrepareWorkspace => self.prepare_workspace(&paths),
+                BuildStage::PrepareWorkspace => self.prepare_workspace(config, &paths),
                 BuildStage::ValidateToolchain => self.ensure_toolchain(),
                 BuildStage::EnsureSource => self.ensure_source_tree(config, &paths),
                 BuildStage::ConfigureKernel => self.configure_kernel(config, &paths),
@@ -214,10 +233,16 @@ impl<P: ProcessExecutor, F: FileSystem> BuildService<P, F> {
         Ok(())
     }
 
-    fn prepare_workspace(&self, paths: &BuildPaths) -> Result<(), BuildError> {
+    fn prepare_workspace(&self, config: &KernelBuildConfig, paths: &BuildPaths) -> Result<(), BuildError> {
+        if self.filesystem.path_exists(&paths.root) {
+            self.filesystem.remove_dir_all(&paths.root)?;
+        }
+
+        self.filesystem.create_dir_all(&paths.root)?;
         self.filesystem.create_dir_all(&paths.bundle_dir)?;
         self.filesystem.create_dir_all(&paths.package_root)?;
         self.filesystem.create_dir_all(&paths.source_dir)?;
+        self.write_manifest(config, paths)?;
         Ok(())
     }
 
@@ -283,36 +308,75 @@ impl<P: ProcessExecutor, F: FileSystem> BuildService<P, F> {
 
     fn compile_kernel(&self, config: &KernelBuildConfig, paths: &BuildPaths) -> Result<(), BuildError> {
         let cpu_count = cpu_count_shell();
-        let command = match config.package_format() {
-            PackageFormat::Debian => format!(
-                r#"
-                set -e
-                cd '{source}'
-                make -j{cpu_count} bindeb-pkg LOCALVERSION=-vinmod KDEB_PKGVERSION=1.0
-                "#,
-                source = shell_quote(paths.source_dir.to_string_lossy()),
-                cpu_count = cpu_count,
-            ),
-            _ => format!(
-                r#"
-                set -e
-                cd '{source}'
-                make -j{cpu_count}
-                make modules_install INSTALL_MOD_PATH='{bundle}' >/dev/null 2>&1 || true
-                "#,
-                source = shell_quote(paths.source_dir.to_string_lossy()),
-                bundle = shell_quote(paths.package_root.to_string_lossy()),
-                cpu_count = cpu_count,
-            ),
-        };
+        match config.package_format() {
+            PackageFormat::Debian => {
+                let bindeb_command = format!(
+                    r#"
+                    set -e
+                    cd '{source}'
+                    make -j{cpu_count} bindeb-pkg LOCALVERSION=-vinmod KDEB_PKGVERSION=1.0
+                    "#,
+                    source = shell_quote(paths.source_dir.to_string_lossy()),
+                    cpu_count = cpu_count,
+                );
 
-        let output = self.run_shell(&command)?;
-        self.emit_process_output("kernel compilation", &output);
-        if !output.success {
-            return Err(BuildError::CommandFailed(output.stderr));
+                let bindeb_output = self.run_shell(&bindeb_command)?;
+                self.emit_process_output("kernel compilation (bindeb)", &bindeb_output);
+
+                if bindeb_output.success {
+                    return Ok(());
+                }
+
+                if !is_debian_builddep_failure(&bindeb_output) {
+                    return Err(BuildError::CommandFailed(bindeb_output.stderr));
+                }
+
+                info!(
+                    "Debian build dependencies not satisfied for bindeb-pkg, using fallback local package flow"
+                );
+
+                let fallback_command = format!(
+                    r#"
+                    set -e
+                    cd '{source}'
+                    make -j{cpu_count}
+                    make modules_install INSTALL_MOD_PATH='{bundle}'
+                    "#,
+                    source = shell_quote(paths.source_dir.to_string_lossy()),
+                    bundle = shell_quote(paths.package_root.to_string_lossy()),
+                    cpu_count = cpu_count,
+                );
+
+                let fallback_output = self.run_shell(&fallback_command)?;
+                self.emit_process_output("kernel compilation (fallback)", &fallback_output);
+                if !fallback_output.success {
+                    return Err(BuildError::CommandFailed(fallback_output.stderr));
+                }
+
+                Ok(())
+            }
+            _ => {
+                let command = format!(
+                    r#"
+                    set -e
+                    cd '{source}'
+                    make -j{cpu_count}
+                    make modules_install INSTALL_MOD_PATH='{bundle}' >/dev/null 2>&1 || true
+                    "#,
+                    source = shell_quote(paths.source_dir.to_string_lossy()),
+                    bundle = shell_quote(paths.package_root.to_string_lossy()),
+                    cpu_count = cpu_count,
+                );
+
+                let output = self.run_shell(&command)?;
+                self.emit_process_output("kernel compilation", &output);
+                if !output.success {
+                    return Err(BuildError::CommandFailed(output.stderr));
+                }
+
+                Ok(())
+            }
         }
-
-        Ok(())
     }
 
     fn package_output(&self, config: &KernelBuildConfig, paths: &BuildPaths) -> Result<(), BuildError> {
@@ -321,7 +385,7 @@ impl<P: ProcessExecutor, F: FileSystem> BuildService<P, F> {
                 let locate_command = format!(
                     r#"
                     set -e
-                    find '{parent}' -maxdepth 1 -type f \( -name '*.deb' -o -name '*.dsc' -o -name '*.changes' \) | sort
+                    find '{parent}' -maxdepth 1 -type f -name '*.deb' | sort | head -n 1
                     "#,
                     parent = shell_quote(paths.source_dir.parent().unwrap_or(&paths.root).to_string_lossy()),
                 );
@@ -332,13 +396,75 @@ impl<P: ProcessExecutor, F: FileSystem> BuildService<P, F> {
                     return Err(BuildError::CommandFailed(output.stderr));
                 }
 
-                if output.stdout.trim().is_empty() {
-                    return Err(BuildError::MissingArtifact(
-                        "Debian package was not generated by bindeb-pkg".to_string(),
-                    ));
+                if !output.stdout.trim().is_empty() {
+                    let package_path = output.stdout.trim();
+                    let copy_command = format!(
+                        "cp -f {} {}",
+                        shell_quote(package_path),
+                        shell_quote(paths.output_path.to_string_lossy())
+                    );
+                    let copy_output = self.run_shell(&copy_command)?;
+                    self.emit_process_output("debian package copy", &copy_output);
+                    if !copy_output.success {
+                        return Err(BuildError::CommandFailed(copy_output.stderr));
+                    }
+
+                    return Ok(());
                 }
 
-                self.filesystem.write_string(&paths.output_path, &output.stdout)?;
+                self.filesystem
+                    .create_dir_all(&paths.package_root.join("DEBIAN"))?;
+                self.filesystem
+                    .create_dir_all(&paths.package_root.join("usr/share/vinmod"))?;
+
+                let control = format!(
+                    "Package: vinmod-kernel\nVersion: {}\nArchitecture: all\nMaintainer: VinMod\nDescription: Local fallback Debian package generated by VinMod\n",
+                    config.kernel_version(),
+                );
+                self.filesystem.write_string(&paths.package_root.join("DEBIAN/control"), &control)?;
+
+                let info_file = format!(
+                    "Kernel version: {}\nArchitecture: {}\nScheduler: {}\nLTO: {}\nHZ: {}\nNR_CPUS: {}\n",
+                    config.kernel_version(),
+                    config.architecture(),
+                    config.scheduler(),
+                    config.lto(),
+                    config.hz(),
+                    config.nr_cpus(),
+                );
+                self.filesystem.write_string(
+                    &paths.package_root.join("usr/share/vinmod/build-info.txt"),
+                    &info_file,
+                )?;
+
+                let dpkg_command = format!(
+                    "dpkg-deb --build {} {}",
+                    shell_quote(paths.package_root.to_string_lossy()),
+                    shell_quote(paths.output_path.to_string_lossy())
+                );
+                let dpkg_output = self.run_shell(&dpkg_command)?;
+                self.emit_process_output("debian fallback package", &dpkg_output);
+
+                if !dpkg_output.success {
+                    let tar_fallback = paths.output_path.with_extension("tar.gz");
+                    let tar_command = format!(
+                        "tar -czf {} -C {} {}",
+                        shell_quote(tar_fallback.to_string_lossy()),
+                        shell_quote(paths.bundle_dir.to_string_lossy()),
+                        shell_quote(paths.package_root.file_name().and_then(|n| n.to_str()).unwrap_or("bundle"))
+                    );
+                    let tar_output = self.run_shell(&tar_command)?;
+                    self.emit_process_output("debian tar fallback", &tar_output);
+                    if !tar_output.success {
+                        return Err(BuildError::CommandFailed(tar_output.stderr));
+                    }
+                    return Err(BuildError::MissingArtifact(
+                        format!(
+                            "Debian package generation failed; fallback tarball created at {}",
+                            tar_fallback.display()
+                        ),
+                    ));
+                }
             }
             PackageFormat::RedHat | PackageFormat::Arch | PackageFormat::Tarball => {
                 let command = format!(
@@ -477,4 +603,11 @@ fn shell_quote(value: impl AsRef<str>) -> String {
 
 fn cpu_count_shell() -> String {
     "$(nproc --all 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)".to_string()
+}
+
+fn is_debian_builddep_failure(output: &ProcessOutput) -> bool {
+    let text = format!("{}\n{}", output.stdout, output.stderr).to_lowercase();
+    text.contains("dpkg-checkbuilddeps")
+        || text.contains("unmet build dependencies")
+        || text.contains("build dependencies/conflicts unsatisfied")
 }

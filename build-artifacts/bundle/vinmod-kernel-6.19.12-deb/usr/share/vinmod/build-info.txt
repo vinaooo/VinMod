@@ -1,10 +1,6 @@
-VinMod build bundle
-
 Kernel version: 6.19.12
 Architecture: native
 Scheduler: cachyos
 LTO: thin
 HZ: 1000
-Tick type: nohz_idle
-Preemption: preempt
-Package: deb
+NR_CPUS: 32

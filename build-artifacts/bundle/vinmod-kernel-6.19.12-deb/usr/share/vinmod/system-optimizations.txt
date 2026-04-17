@@ -1,3 +1,0 @@
-O3
-performance_governor
-tcp_bbr3
