@@ -10,7 +10,7 @@ Whether you want better frame rates, reduced input latency, or just an overall s
 - **Gaming-Focused:** Tailor your kernel to extract every drop of performance from your machine.
 - **Fully Customizable:** Select the exact options that make sense for your specific hardware setup.
 - **One-Click Build:** Once you've made your choices, simply click **"Start Build Process"**. VinMod handles the rest!
-- **Ready to Install:** The app outputs a standard, ready-to-use `.deb` package at the end of the process.
+- **Ready to Install:** The app outputs standard Debian packages for both the kernel and its headers at the end of the process.
 
 ## Compatibility
 VinMod is compatible with any Linux distribution that uses the `.deb` package manager (such as Debian, Ubuntu, Pop!_OS, Linux Mint, and others). 
@@ -18,10 +18,15 @@ VinMod is compatible with any Linux distribution that uses the `.deb` package ma
 ## Requirements
 To use VinMod, you will need to have basic build tools installed on your system (e.g., `build-essential` and standard kernel compilation dependencies). 
 
+For Debian/Ubuntu environments, install missing packaging dependencies with:
+
+sudo apt-get update
+sudo apt-get install -y debhelper-compat libdw-dev
+
 ## Getting Started
 1. Launch the VinMod application.
 2. Browse the available hardware and performance options.
 3. Tweak the assistant settings to match your hardware preferences.
 4. Click **"Start Build Process"**.
-5. Wait for the process to finish, then install the generated `.deb` file on your system.
+5. Wait for the process to finish, then install the generated kernel and headers `.deb` files on your system.
 6. Reboot and start gaming!

@@ -1,7 +1,10 @@
 use std::cell::Cell;
 use std::cell::RefCell;
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::Path;
 use std::rc::Rc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use gtk4::{Button, StringList, Stack, StackSidebar, StackTransitionType};
 use libadwaita::prelude::*;
@@ -25,6 +28,7 @@ pub struct BuildForm {
     preempt_row: ComboRow,
     hugepages_row: ComboRow,
     package_format_row: ComboRow,
+    verbose_switch: SwitchRow,
     cpus_row: SpinRow,
     o3_switch: SwitchRow,
     os_switch: SwitchRow,
@@ -123,6 +127,10 @@ impl BuildForm {
                     ("Arch Linux (pkg.tar.zst)", "Gera pacote nativo para Arch Linux, Manjaro, CachyOS."),
                     ("Tarball (.tar.gz)", "Gera um arquivo unificado simples bruto."),
                 ],
+            ),
+            verbose_switch: create_checkbox(
+                "Verbose mode (show full command stdout/stderr in console)",
+                false,
             ),
             cpus_row: create_labeled_spinbutton(
                 "Max CPU/Thread Capacity (NR_CPUS)",
@@ -241,6 +249,51 @@ fn create_checkbox(title: &str, default_active: bool) -> SwitchRow {
         .build()
 }
 
+type SharedBuildLog = std::sync::Arc<std::sync::Mutex<std::fs::File>>;
+
+fn open_build_log() -> Option<SharedBuildLog> {
+    if std::fs::create_dir_all("build-artifacts").is_err() {
+        return None;
+    }
+
+    OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("build-artifacts/build.log")
+        .ok()
+        .map(|file| std::sync::Arc::new(std::sync::Mutex::new(file)))
+}
+
+fn append_build_log(log: &Option<SharedBuildLog>, text: &str) {
+    if let Some(log_file) = log {
+        if let Ok(mut handle) = log_file.lock() {
+            let _ = handle.write_all(text.as_bytes());
+            let _ = handle.flush();
+        }
+    }
+}
+
+fn append_console_output(
+    buffer: &gtk4::TextBuffer,
+    text_view: &gtk4::TextView,
+    log: &Option<SharedBuildLog>,
+    text: &str,
+) {
+    let mut end_iter = buffer.end_iter();
+    buffer.insert(&mut end_iter, text);
+
+    let mut scroll_iter = buffer.end_iter();
+    text_view.scroll_to_iter(&mut scroll_iter, 0.0, false, 0.0, 1.0);
+
+    append_build_log(log, text);
+}
+
+fn format_elapsed(seconds: u64) -> String {
+    let minutes = seconds / 60;
+    let remaining_seconds = seconds % 60;
+    format!("{minutes:02}:{remaining_seconds:02}")
+}
+
 fn kernel_version_from_index(index: u32) -> &'static str {
     match index {
         1 => "7.x-mainline",
@@ -340,7 +393,7 @@ fn status_stage_from_message(message: &str) -> Option<&'static str> {
         "Acquiring kernel source tree..." => Some("Acquiring source tree"),
         "Configuring kernel profile..." => Some("Configuring kernel"),
         "Compiling kernel and modules..." => Some("Compiling kernel"),
-        "Packaging build output..." => Some("Packaging output"),
+        "Packaging Debian kernel + headers..." => Some("Packaging kernel + headers"),
         "Finalizing build output..." => Some("Finalizing"),
         _ => None,
     }
@@ -353,7 +406,7 @@ fn stage_label_from_key(key: &str) -> &'static str {
         "ensure-source" => "Acquiring source tree",
         "configure-kernel" => "Configuring kernel",
         "compile-kernel" => "Compiling kernel",
-        "package-output" => "Packaging output",
+        "package-output" => "Packaging kernel + headers",
         "finalize" => "Finalizing",
         _ => "Running",
     }
@@ -414,6 +467,7 @@ pub fn build_console_page(form: &BuildForm) -> gtk4::Box {
     page.add(&pkg_group);
 
     pkg_group.add(&form.package_format_row);
+    pkg_group.add(&form.verbose_switch);
 
     let action_group = PreferencesGroup::builder()
         .title("Build Action")
@@ -440,6 +494,12 @@ pub fn build_console_page(form: &BuildForm) -> gtk4::Box {
     status_label.set_margin_top(8);
     status_label.set_margin_bottom(8);
 
+    let elapsed_label = gtk4::Label::new(Some("Elapsed: 00:00"));
+    elapsed_label.set_halign(gtk4::Align::Start);
+    elapsed_label.set_margin_start(12);
+    elapsed_label.set_margin_end(12);
+    elapsed_label.set_margin_bottom(4);
+
     let progress_bar = gtk4::ProgressBar::new();
     progress_bar.set_fraction(0.0);
     progress_bar.set_show_text(true);
@@ -449,7 +509,9 @@ pub fn build_console_page(form: &BuildForm) -> gtk4::Box {
     progress_bar.set_margin_bottom(8);
 
     let text_buffer_clone = text_buffer.clone();
+    let text_view_clone = text_view.clone();
     let package_format_row_clone = form.package_format_row.clone();
+    let verbose_switch_clone = form.verbose_switch.clone();
     let kernel_version_row_clone = form.kernel_version_row.clone();
     let architecture_row_clone = form.architecture_row.clone();
     let scheduler_row_clone = form.scheduler_row.clone();
@@ -465,6 +527,7 @@ pub fn build_console_page(form: &BuildForm) -> gtk4::Box {
     let bbr3_switch_clone = form.bbr3_switch.clone();
     let zfs_switch_clone = form.zfs_switch.clone();
     let status_label_clone = status_label.clone();
+    let elapsed_label_clone = elapsed_label.clone();
     let progress_bar_clone = progress_bar.clone();
 
     let is_building = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -477,7 +540,9 @@ pub fn build_console_page(form: &BuildForm) -> gtk4::Box {
         let progress_bar_clone = progress_bar_clone.clone();
         let current_stage = current_stage.clone();
         let text_buffer_clone = text_buffer_clone.clone();
+        let text_view_clone = text_view_clone.clone();
         let package_format_row_clone = package_format_row_clone.clone();
+        let verbose_switch_clone = verbose_switch_clone.clone();
         let kernel_version_row_clone = kernel_version_row_clone.clone();
         let architecture_row_clone = architecture_row_clone.clone();
         let scheduler_row_clone = scheduler_row_clone.clone();
@@ -492,6 +557,7 @@ pub fn build_console_page(form: &BuildForm) -> gtk4::Box {
         let governor_switch_clone = governor_switch_clone.clone();
         let bbr3_switch_clone = bbr3_switch_clone.clone();
         let zfs_switch_clone = zfs_switch_clone.clone();
+        let elapsed_label_clone = elapsed_label_clone.clone();
 
         Rc::new(move |btn: Button, previous_build_exists: bool| {
             is_building_clone.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -499,22 +565,38 @@ pub fn build_console_page(form: &BuildForm) -> gtk4::Box {
             status_label_clone.set_label("Status: Starting...");
             progress_bar_clone.set_fraction(0.0);
             progress_bar_clone.set_text(Some("0/7 - Starting"));
+            elapsed_label_clone.set_label("Elapsed: 00:00");
             current_stage.replace("Starting".to_string());
 
             log::info!("Build process initiated from UI");
             let buffer = text_buffer_clone.clone();
-            buffer.set_text("Starting build process...\n");
-            let mut start_iter = buffer.end_iter();
-            buffer.insert(
-                &mut start_iter,
+            let text_view = text_view_clone.clone();
+            let build_log = open_build_log();
+
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            append_build_log(
+                &build_log,
+                &format!("\n===== Build Run (unix={now}) =====\n"),
+            );
+
+            buffer.set_text("");
+            append_console_output(&buffer, &text_view, &build_log, "Starting build process...\n");
+            append_console_output(
+                &buffer,
+                &text_view,
+                &build_log,
                 "Build can take several minutes depending on hardware and selected options.\n",
             );
             if previous_build_exists {
                 status_label_clone.set_label("Status: Cleaning previous build...");
                 progress_bar_clone.set_text(Some("0/7 - Cleaning previous build"));
-                let mut cleanup_iter = buffer.end_iter();
-                buffer.insert(
-                    &mut cleanup_iter,
+                append_console_output(
+                    &buffer,
+                    &text_view,
+                    &build_log,
                     "Previous build artifacts detected and will be deleted before this run.\n",
                 );
             }
@@ -526,19 +608,46 @@ pub fn build_console_page(form: &BuildForm) -> gtk4::Box {
             let status_label_main = status_label_clone.clone();
             let progress_bar_main = progress_bar_clone.clone();
             let current_stage_main = current_stage.clone();
+            let build_flag_main = is_building_clone.clone();
+            let text_view_main = text_view.clone();
+            let build_log_main = build_log.clone();
 
             gtk4::glib::source::timeout_add_local(std::time::Duration::from_millis(50), move || {
-                let mut finished = false;
+                let mut stop_listener = false;
                 while let Ok(text) = receiver.try_recv() {
                     if text == "__FINISHED__" {
                         main_context_btn.set_label("Start Build Process");
                         status_label_main.set_label("Status: Completed");
                         progress_bar_main.set_fraction(1.0);
-                        progress_bar_main.set_text(Some("Completed"));
-                        finished = true;
+                        progress_bar_main.set_text(Some("Completed: kernel + headers"));
+                        build_flag_main.store(false, std::sync::atomic::Ordering::SeqCst);
+                        current_stage_main.replace("Completed".to_string());
+                        stop_listener = true;
+                    } else if text == "__FAILED__" {
+                        main_context_btn.set_label("Start Build Process");
+                        status_label_main.set_label("Status: Error");
+                        progress_bar_main.set_fraction(0.0);
+                        progress_bar_main.set_text(Some("Error: build failed"));
+                        build_flag_main.store(false, std::sync::atomic::Ordering::SeqCst);
+                        current_stage_main.replace("Error".to_string());
+                        stop_listener = true;
+                    } else if text == "__CANCELLED__" {
+                        main_context_btn.set_label("Start Build Process");
+                        status_label_main.set_label("Status: Cancelled");
+                        progress_bar_main.set_fraction(0.0);
+                        progress_bar_main.set_text(Some("Cancelled"));
+                        build_flag_main.store(false, std::sync::atomic::Ordering::SeqCst);
+                        current_stage_main.replace("Cancelled".to_string());
+                        stop_listener = true;
                     } else if text.starts_with("ERROR:") {
                         status_label_main.set_label("Status: Error");
-                        progress_bar_main.set_text(Some("Error"));
+                        progress_bar_main.set_text(Some("Error: see logs"));
+                        append_console_output(
+                            &main_context_buffer,
+                            &text_view_main,
+                            &build_log_main,
+                            &text,
+                        );
                     } else if text.starts_with("__PROGRESS__|") {
                         let payload = text.trim();
                         let mut parts = payload.split('|');
@@ -567,12 +676,16 @@ pub fn build_console_page(form: &BuildForm) -> gtk4::Box {
                             current_stage_main.replace(stage.to_string());
                             status_label_main.set_label(&format!("Status: {stage}"));
                         }
-                        let mut end_iter = main_context_buffer.end_iter();
-                        main_context_buffer.insert(&mut end_iter, &text);
+                        append_console_output(
+                            &main_context_buffer,
+                            &text_view_main,
+                            &build_log_main,
+                            &text,
+                        );
                     }
                 }
 
-                if finished {
+                if stop_listener {
                     gtk4::glib::ControlFlow::Break
                 } else {
                     gtk4::glib::ControlFlow::Continue
@@ -586,6 +699,24 @@ pub fn build_console_page(form: &BuildForm) -> gtk4::Box {
             let heartbeat_stage = current_stage.clone();
             let heartbeat_status = status_label_clone.clone();
             let heartbeat_progress = progress_bar_clone.clone();
+            let heartbeat_view = text_view.clone();
+            let heartbeat_log = build_log.clone();
+
+            let elapsed_seconds = Rc::new(Cell::new(0u64));
+            let elapsed_seconds_clone = elapsed_seconds.clone();
+            let elapsed_label_tick = elapsed_label_clone.clone();
+            let elapsed_flag = is_building_clone.clone();
+
+            gtk4::glib::source::timeout_add_local(std::time::Duration::from_secs(1), move || {
+                if !elapsed_flag.load(std::sync::atomic::Ordering::SeqCst) {
+                    return gtk4::glib::ControlFlow::Break;
+                }
+
+                let next = elapsed_seconds_clone.get() + 1;
+                elapsed_seconds_clone.set(next);
+                elapsed_label_tick.set_label(&format!("Elapsed: {}", format_elapsed(next)));
+                gtk4::glib::ControlFlow::Continue
+            });
 
             gtk4::glib::source::timeout_add_local(std::time::Duration::from_secs(5), move || {
                 if !heartbeat_flag.load(std::sync::atomic::Ordering::SeqCst) {
@@ -602,9 +733,10 @@ pub fn build_console_page(form: &BuildForm) -> gtk4::Box {
                     _ => "\\",
                 };
 
-                let mut end_iter = heartbeat_buffer.end_iter();
-                heartbeat_buffer.insert(
-                    &mut end_iter,
+                append_console_output(
+                    &heartbeat_buffer,
+                    &heartbeat_view,
+                    &heartbeat_log,
                     &format!("{spinner} Build still running... elapsed: {elapsed}s\n"),
                 );
 
@@ -617,6 +749,7 @@ pub fn build_console_page(form: &BuildForm) -> gtk4::Box {
 
             let cancel_flag = is_building_clone.clone();
             let package_format = PackageFormat::from_index(package_format_row_clone.selected());
+            let verbose_mode = verbose_switch_clone.is_active();
             let kernel_version = kernel_version_row_clone.selected();
             let architecture = architecture_row_clone.selected();
             let scheduler = scheduler_row_clone.selected();
@@ -662,20 +795,25 @@ pub fn build_console_page(form: &BuildForm) -> gtk4::Box {
                 let _hugepages_profile = hugepages_from_index(hugepages);
                 let service = DefaultBuildService::new();
 
-                let run_result = service.run_build(
+                let run_result = service.run_build_verbose(
                     &config,
                     |message| {
                         let _ = sender.send(message);
                     },
                     || !cancel_flag.load(std::sync::atomic::Ordering::SeqCst),
+                    verbose_mode,
                 );
 
                 if let Err(err) = run_result {
                     let _ = sender.send(format!("ERROR: {err}\n"));
+                    let _ = sender.send("__FAILED__".to_string());
+                } else if !cancel_flag.load(std::sync::atomic::Ordering::SeqCst) {
+                    let _ = sender.send("__CANCELLED__".to_string());
+                } else {
+                    let _ = sender.send("__FINISHED__".to_string());
                 }
 
                 cancel_flag.store(false, std::sync::atomic::Ordering::SeqCst);
-                let _ = sender.send("__FINISHED__".to_string());
             });
         })
     };
@@ -726,10 +864,47 @@ pub fn build_console_page(form: &BuildForm) -> gtk4::Box {
         launch_build(btn.clone(), false);
     });
 
+    let open_log_btn = Button::with_label("Open build.log");
+    open_log_btn.set_valign(gtk4::Align::Center);
+    let open_log_buffer = text_buffer.clone();
+    let open_log_view = text_view.clone();
+    open_log_btn.connect_clicked(move |_| {
+        let no_log: Option<SharedBuildLog> = None;
+        if !Path::new("build-artifacts/build.log").exists() {
+            append_console_output(
+                &open_log_buffer,
+                &open_log_view,
+                &no_log,
+                "build-artifacts/build.log not found yet. Start a build first.\n",
+            );
+            return;
+        }
+
+        match std::process::Command::new("xdg-open")
+            .arg("build-artifacts/build.log")
+            .spawn()
+        {
+            Ok(_) => append_console_output(
+                &open_log_buffer,
+                &open_log_view,
+                &no_log,
+                "Opened build-artifacts/build.log in system viewer.\n",
+            ),
+            Err(error) => append_console_output(
+                &open_log_buffer,
+                &open_log_view,
+                &no_log,
+                &format!("Failed to open build log: {error}\n"),
+            ),
+        }
+    });
+
     action_row.add_suffix(&build_btn);
+    action_row.add_suffix(&open_log_btn);
     action_group.add(&action_row);
     container.append(&page);
     container.append(&status_label);
+    container.append(&elapsed_label);
     container.append(&progress_bar);
 
     let scrolled_window = gtk4::ScrolledWindow::builder()

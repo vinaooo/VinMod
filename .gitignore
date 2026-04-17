@@ -6,3 +6,12 @@ Cargo.lock
 *_backup
 /tests
 /docs
+
+# Kernel Build Artifacts
+/build-artifacts/
+*.deb
+*.buildinfo
+*.changes
+*.tar.xz
+*.tar.gz
+*.pkg.tar.gz
