@@ -1,0 +1,5 @@
+Package: vinmod-kernel
+Version: 6.19.12
+Architecture: all
+Maintainer: VinMod
+Description: Generated kernel bundle for deb
